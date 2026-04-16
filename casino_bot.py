@@ -5045,6 +5045,273 @@ async def start_oxapay_webhook_server(application=None):
     logging.info(f"OxaPay webhook server listening on 0.0.0.0:{OXAPAY_WEBHOOK_PORT}")
 
 
+# ===== PLINKO WEB DASHBOARD SERVER =====
+# Telegram WebApp initData validation
+def _validate_telegram_webapp_data(init_data_raw: str) -> dict | None:
+    """Validate Telegram WebApp initData using HMAC-SHA256.
+    Returns parsed user dict on success, None on failure."""
+    if not init_data_raw:
+        return None
+    try:
+        import urllib.parse as urlparse
+        params = dict(urlparse.parse_qsl(init_data_raw, keep_blank_values=True))
+        received_hash = params.pop('hash', '')
+        if not received_hash:
+            return None
+
+        # Build check string (alphabetically sorted key=value pairs)
+        data_check_string = '\n'.join(f"{k}={v}" for k, v in sorted(params.items()))
+
+        # HMAC-SHA256 with WebAppData key
+        secret_key = hmac.new(b'WebAppData', BOT_TOKEN.encode(), hashlib.sha256).digest()
+        computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(computed_hash, received_hash):
+            return None
+
+        # Parse user JSON
+        user_json = params.get('user', '{}')
+        user_data = json.loads(user_json)
+        return user_data
+    except Exception as e:
+        logging.error(f"WebApp data validation error: {e}")
+        return None
+
+
+async def _plinko_get_user_from_request(request: aiohttp.web.Request) -> dict | None:
+    """Extract and validate user from Plinko web request."""
+    auth_token = request.headers.get('X-Auth-Token', '')
+    user_data = _validate_telegram_webapp_data(auth_token)
+    if not user_data or 'id' not in user_data:
+        return None
+    return user_data
+
+
+async def plinko_serve_html(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """Serve the Plinko web dashboard HTML."""
+    html_path = os.path.join(os.path.dirname(__file__), 'plinko_web', 'index.html')
+    if not os.path.exists(html_path):
+        return aiohttp.web.Response(text="Plinko dashboard not found", status=404)
+    with open(html_path, 'r', encoding='utf-8') as f:
+        html_content = f.read()
+    return aiohttp.web.Response(text=html_content, content_type='text/html')
+
+
+async def plinko_api_user(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """GET /plinko/api/user - Get user balance and provably fair seeds."""
+    user_data = await _plinko_get_user_from_request(request)
+    if not user_data:
+        return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+    user_id = user_data['id']
+    username = user_data.get('username', user_data.get('first_name', 'Player'))
+
+    # Ensure user exists in wallets
+    if user_id not in user_stats:
+        # User needs to be initialized via bot first
+        return aiohttp.web.json_response({"error": "Please start the bot first with /start"}, status=403)
+
+    balance_usd = get_active_balance_usd(user_id)
+    active_coin = get_active_currency(user_id)
+
+    # Get or generate provably fair seeds
+    seeds = get_user_seeds(user_id)
+    server_seed_hash = hashlib.sha256(seeds['server_seed'].encode()).hexdigest()
+
+    return aiohttp.web.json_response({
+        "user_id": user_id,
+        "username": username,
+        "balance": round(balance_usd, 2),
+        "active_coin": active_coin,
+        "server_seed_hash": server_seed_hash,
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds.get('nonce', 0)
+    })
+
+
+async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """POST /plinko/api/bet - Place a Plinko bet from web dashboard."""
+    user_data = await _plinko_get_user_from_request(request)
+    if not user_data:
+        return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+    user_id = user_data['id']
+    if user_id not in user_stats:
+        return aiohttp.web.json_response({"error": "Please start the bot first"}, status=403)
+
+    # Check bans
+    if user_id in _banned_set:
+        return aiohttp.web.json_response({"error": "Account restricted"}, status=403)
+
+    # Check game enabled
+    if not is_game_enabled("plinko"):
+        return aiohttp.web.json_response({"error": "Plinko is under maintenance"}, status=503)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return aiohttp.web.json_response({"error": "Invalid request body"}, status=400)
+
+    bet_amount = body.get('amount', 0)
+    risk = body.get('risk', 'medium')
+    rows = body.get('rows', 16)
+
+    # Validate inputs
+    if not isinstance(bet_amount, (int, float)) or bet_amount < PLINKO_WEB_MIN_BET:
+        return aiohttp.web.json_response({"error": f"Minimum bet is ${PLINKO_WEB_MIN_BET:.2f}"}, status=400)
+    if bet_amount > PLINKO_WEB_MAX_BET:
+        return aiohttp.web.json_response({"error": f"Maximum bet is ${PLINKO_WEB_MAX_BET:.2f}"}, status=400)
+    if risk not in ('low', 'medium', 'high'):
+        return aiohttp.web.json_response({"error": "Invalid risk level"}, status=400)
+    if rows not in (8, 10, 12, 14, 16):
+        return aiohttp.web.json_response({"error": "Invalid row count"}, status=400)
+
+    # Check balance
+    balance_usd = get_active_balance_usd(user_id)
+    if bet_amount > balance_usd + 0.001:
+        return aiohttp.web.json_response({"error": "Insufficient balance"}, status=400)
+
+    # Deduct bet atomically
+    try:
+        crypto_deducted, coin = await deduct_wallet_safe(user_id, bet_amount)
+    except ValueError:
+        return aiohttp.web.json_response({"error": "Insufficient balance"}, status=400)
+
+    # Get multipliers for this row/risk combo
+    mults = PLINKO_WEB_MULTIPLIERS.get(rows, {}).get(risk, PLINKO_MULTIPLIERS.get(risk, [1.0]))
+    num_slots = len(mults)
+
+    # Generate provably fair result
+    seeds = get_user_seeds(user_id)
+    server_seed = seeds['server_seed']
+    client_seed = seeds['client_seed']
+    nonce = seeds.get('nonce', 0)
+    result_index = get_provably_fair_result(server_seed, client_seed, nonce, num_slots)
+    multiplier = mults[result_index]
+
+    winnings = bet_amount * multiplier
+    profit = winnings - bet_amount
+    win = multiplier >= 1.0
+
+    # Credit winnings
+    credit_wallet(user_id, winnings)
+
+    # Generate game ID and record
+    game_id = generate_unique_id('PLINKO')
+    increment_user_nonce(user_id)
+
+    # Update stats
+    await update_stats_on_bet(user_id, game_id, bet_amount, win, multiplier=multiplier, context=None)
+    save_user_data(user_id)
+
+    # Store game session
+    game_sessions[game_id] = {
+        "id": game_id,
+        "game_type": "plinko",
+        "user_id": user_id,
+        "bet_amount": bet_amount,
+        "active_currency": get_active_currency(user_id),
+        "crypto_bet_amount": bet_amount / LIVE_PRICES.get(get_active_currency(user_id), 1.0),
+        "risk": risk,
+        "rows": rows,
+        "result_index": result_index,
+        "multiplier": multiplier,
+        "status": "completed",
+        "timestamp": str(datetime.now(timezone.utc)),
+        "win": win,
+        "profit": profit,
+        "server_seed": server_seed,
+        "client_seed": client_seed,
+        "nonce": nonce,
+        "source": "web"
+    }
+
+    # Store provably fair record
+    store_provably_fair_record(game_id, "plinko", server_seed, client_seed, nonce,
+                               result_data=f"Risk: {risk}, Rows: {rows}, Slot: {result_index + 1}, Multiplier: {multiplier}x")
+
+    new_balance = get_active_balance_usd(user_id)
+
+    return aiohttp.web.json_response({
+        "game_id": game_id,
+        "slot": result_index,
+        "multiplier": multiplier,
+        "bet_amount": round(bet_amount, 2),
+        "winnings": round(winnings, 2),
+        "profit": round(profit, 2),
+        "win": win,
+        "new_balance": round(new_balance, 2),
+        "nonce": nonce
+    })
+
+
+async def plinko_api_history(request: aiohttp.web.Request) -> aiohttp.web.Response:
+    """GET /plinko/api/history - Get user's recent plinko bets."""
+    user_data = await _plinko_get_user_from_request(request)
+    if not user_data:
+        return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
+
+    user_id = user_data['id']
+    stats = user_stats.get(user_id, {})
+    game_ids = stats.get('game_sessions', [])
+
+    bets = []
+    for gid in reversed(game_ids[-50:]):
+        game = game_sessions.get(gid)
+        if game and game.get('game_type') == 'plinko' and game.get('status') == 'completed':
+            bets.append({
+                "game_id": game['id'],
+                "risk": game.get('risk', 'medium'),
+                "rows": game.get('rows', 16),
+                "slot": game.get('result_index', 0),
+                "multiplier": game.get('multiplier', 0),
+                "bet_amount": round(game.get('bet_amount', 0), 2),
+                "profit": round(game.get('bet_amount', 0) * game.get('multiplier', 0) - game.get('bet_amount', 0), 2),
+                "win": game.get('win', False),
+                "timestamp": game.get('timestamp', '')
+            })
+            if len(bets) >= 20:
+                break
+
+    return aiohttp.web.json_response({"bets": bets})
+
+
+async def start_plinko_web_server(application=None):
+    """Start the Plinko web dashboard aiohttp server."""
+    if not PLINKO_WEB_ENABLED:
+        logging.info("Plinko web dashboard disabled.")
+        return
+
+    plinko_app = aiohttp.web.Application()
+
+    # CORS middleware for Telegram WebApp
+    @aiohttp.web.middleware
+    async def cors_middleware(request, handler):
+        if request.method == 'OPTIONS':
+            resp = aiohttp.web.Response()
+        else:
+            resp = await handler(request)
+        resp.headers['Access-Control-Allow-Origin'] = '*'
+        resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+        resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Auth-Token'
+        return resp
+
+    plinko_app.middlewares.append(cors_middleware)
+
+    # Routes
+    plinko_app.router.add_get('/plinko', plinko_serve_html)
+    plinko_app.router.add_get('/plinko/', plinko_serve_html)
+    plinko_app.router.add_get('/plinko/api/user', plinko_api_user)
+    plinko_app.router.add_post('/plinko/api/bet', plinko_api_bet)
+    plinko_app.router.add_get('/plinko/api/history', plinko_api_history)
+
+    runner = aiohttp.web.AppRunner(plinko_app)
+    await runner.setup()
+    site = aiohttp.web.TCPSite(runner, "0.0.0.0", PLINKO_WEB_PORT)
+    await site.start()
+    logging.info(f"Plinko web dashboard listening on 0.0.0.0:{PLINKO_WEB_PORT}")
+
+
 # ===== BACKGROUND TASKS =====
 
 async def active_scans_monitor_task(application):
@@ -8601,7 +8868,23 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # DM: Original behavior
     # NEW UI STRUCTURE - Casino themed with COLORED buttons (Bot API 9.4)
+    # Build Plinko WebApp URL
+    plinko_web_url = f"{OXAPAY_WEBHOOK_HOST}:{PLINKO_WEB_PORT}/plinko" if OXAPAY_WEBHOOK_HOST else None
+
     keyboard = [
+        # Row 0: Plinko Web Dashboard (NEW - above deposit/withdraw)
+    ]
+
+    # Add Plinko WebApp button if web dashboard is enabled
+    if PLINKO_WEB_ENABLED and plinko_web_url:
+        from telegram import WebAppInfo
+        plinko_btn = InlineKeyboardButton(
+            "Plinko",
+            web_app=WebAppInfo(url=plinko_web_url)
+        )
+        keyboard.append([apply_button_style(plinko_btn, 'success', peb('plinko'))])
+
+    keyboard.extend([
         # Row 1: Deposit & Withdraw with styles
         [
             apply_button_style(InlineKeyboardButton("Deposit", callback_data="main_deposit"), 'primary', peb('deposit')),  # BLUE
@@ -8613,7 +8896,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             apply_button_style(InlineKeyboardButton("More", callback_data="main_more"), 'danger', peb('chart'))  # RED
         ],
         # Row 3: Settings
-    ]
+    ])
 
     # Add Settings button only in DMs
     if update.effective_chat.type == "private":
@@ -8649,9 +8932,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append(links_row_2)
 
     welcome_text = (
-        f"{pe('casino')} <b>Welcome to Casino</b>  {pe('lightning')}\n\n"
+        f"{pe('casino')} <b>Welcome to @playcsino</b>  {pe('lightning')}\n"
+        f"<i>Telegram Casino</i>\n\n"
         f"{pe('balance')} <b>Balance:</b> {formatted_balance}\n"
         f"{pe('chart')} <b>Wagered:</b> {formatted_wagers}\n\n"
+        f"{pe('plinko')} Try <b>Plinko</b> - our newest game!\n"
         f"{pe('game')} Pick an option to get started!"
     )
 
@@ -9048,9 +9333,11 @@ async def start_command_inline(query, context):
             keyboard.append(links_row_2)
 
     welcome_text = (
-        f"{pe('casino')} <b>Welcome to Casino</b>  {pe('lightning')}\n\n"
+        f"{pe('casino')} <b>Welcome to @playcsino</b>  {pe('lightning')}\n"
+        f"<i>Telegram Casino</i>\n\n"
         f"{pe('balance')} <b>Balance:</b> {formatted_balance}\n"
         f"{pe('chart')} <b>Wagered:</b> {formatted_wagers}\n\n"
+        f"{pe('plinko')} Try <b>Plinko</b> - our newest game!\n"
         f"{pe('game')} Pick an option to get started!"
     )
 
@@ -15791,11 +16078,47 @@ async def crash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(result_text, parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(keyboard))
 
 # 2. PLINKO GAME
+# Legacy flat multipliers (kept for /plinko text command backward compat with 16-row medium)
 PLINKO_MULTIPLIERS = {
-    "low": [0.5, 0.7, 0.9, 1.0, 1.2, 1.4, 1.6, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.6],
-    "medium": [0.3, 0.5, 0.7, 1.0, 2.0, 3.0, 5.0, 8.0, 13.0, 18.0, 24.0, 30.0, 33.0],
-    "high": [0.2, 0.3, 0.5, 1.0, 3.0, 10.0, 25.0, 75.0, 150.0, 250.0, 350.0, 420.0]
+    "low": [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
+    "medium": [110, 41, 10, 5, 3, 1.5, 1.0, 0.5, 0.3, 0.5, 1.0, 1.5, 3, 5, 10, 41, 110],
+    "high": [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000]
 }
+
+# Full Plinko multiplier tables for web dashboard (all row/risk combos, ~2% house edge)
+PLINKO_WEB_MULTIPLIERS = {
+    8: {
+        "low":    [5.6, 2.1, 1.1, 1.0, 0.5, 1.0, 1.1, 2.1, 5.6],
+        "medium": [13, 3, 1.3, 0.7, 0.4, 0.7, 1.3, 3, 13],
+        "high":   [29, 4, 1.5, 0.3, 0.2, 0.3, 1.5, 4, 29]
+    },
+    10: {
+        "low":    [8.9, 3, 1.4, 1.1, 1.0, 0.5, 1.0, 1.1, 1.4, 3, 8.9],
+        "medium": [22, 5, 2, 1.4, 0.6, 0.4, 0.6, 1.4, 2, 5, 22],
+        "high":   [76, 10, 3, 0.9, 0.3, 0.2, 0.3, 0.9, 3, 10, 76]
+    },
+    12: {
+        "low":    [10, 3, 1.6, 1.4, 1.1, 1.0, 0.5, 1.0, 1.1, 1.4, 1.6, 3, 10],
+        "medium": [33, 11, 4, 2, 1.1, 0.6, 0.3, 0.6, 1.1, 2, 4, 11, 33],
+        "high":   [170, 24, 8.1, 2, 0.7, 0.2, 0.2, 0.2, 0.7, 2, 8.1, 24, 170]
+    },
+    14: {
+        "low":    [7.1, 4, 1.9, 1.4, 1.3, 1.0, 1.0, 0.5, 1.0, 1.0, 1.3, 1.4, 1.9, 4, 7.1],
+        "medium": [43, 13, 6, 3, 1.3, 1.0, 0.5, 0.3, 0.5, 1.0, 1.3, 3, 6, 13, 43],
+        "high":   [284, 41, 10, 5, 2, 0.5, 0.2, 0.2, 0.2, 0.5, 2, 5, 10, 41, 284]
+    },
+    16: {
+        "low":    [16, 9, 2, 1.4, 1.4, 1.2, 1.1, 1.0, 0.5, 1.0, 1.1, 1.2, 1.4, 1.4, 2, 9, 16],
+        "medium": [110, 41, 10, 5, 3, 1.5, 1.0, 0.5, 0.3, 0.5, 1.0, 1.5, 3, 5, 10, 41, 110],
+        "high":   [1000, 130, 26, 9, 4, 2, 0.2, 0.2, 0.2, 0.2, 0.2, 2, 4, 9, 26, 130, 1000]
+    }
+}
+
+# Plinko Web Dashboard Configuration
+PLINKO_WEB_ENABLED = True
+PLINKO_WEB_PORT = 8081  # Separate port for plinko web dashboard
+PLINKO_WEB_MAX_BET = 500.0
+PLINKO_WEB_MIN_BET = 0.10
 
 @check_banned
 @check_maintenance
@@ -15809,6 +16132,34 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = update.message.text.strip().split()
     await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    # If no args or just /plinko, show WebApp button in DM
+    if len(args) == 1:
+        plinko_web_url = f"{OXAPAY_WEBHOOK_HOST}:{PLINKO_WEB_PORT}/plinko" if OXAPAY_WEBHOOK_HOST else None
+        if PLINKO_WEB_ENABLED and plinko_web_url and update.effective_chat.type == "private":
+            from telegram import WebAppInfo
+            keyboard = [[InlineKeyboardButton(
+                "Open Plinko",
+                web_app=WebAppInfo(url=plinko_web_url)
+            )]]
+            await update.message.reply_text(
+                f"{pe('plinko')} <b>PLINKO</b>\n\n"
+                f"Drop the ball and win big! Choose your risk level, "
+                f"number of rows, and watch the ball bounce.\n\n"
+                f"Tap below to open the Plinko web dashboard:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        # Fallback: show text command usage
+        await update.message.reply_text(
+            f"{pe('plinko')} <b>PLINKO</b>\n\n"
+            "Usage: /plinko amount risk\n"
+            "Risk: low, medium, or high\n"
+            "Example: /plinko 5 medium",
+            parse_mode=ParseMode.HTML
+        )
+        return
 
     if len(args) != 3:
         await update.message.reply_text("Usage: /plinko amount risk\nRisk: low, medium, or high\nExample: /plinko 5 medium")
@@ -18343,6 +18694,426 @@ async def hc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += (f"<b>Bet:</b> ${match['bet_amount']:.2f}\n"
                 f"<b>Status:</b> {match.get('status', 'N/A').capitalize()}\n--------------------\n")
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
+
+
+# ===== USER HISTORY COMMAND =====
+HISTORY_ITEMS_PER_PAGE = 10  # 5 in first row, 5 in second row
+
+async def generate_history_image(user_id: int, context, page: int = 0):
+    """Generate a history template image for the user's game history."""
+    try:
+        stats = user_stats.get(user_id, {})
+        userinfo = stats.get('userinfo', {})
+        first_name = userinfo.get('first_name', 'User')
+        username = userinfo.get('username', 'N/A')
+        total_bets = stats.get('bets', {}).get('count', 0)
+        total_wins = stats.get('bets', {}).get('wins', 0)
+        total_losses = stats.get('bets', {}).get('losses', 0)
+        total_wagered = stats.get('bets', {}).get('amount', 0.0)
+
+        # Get game session IDs in reverse order (newest first)
+        game_ids = list(reversed(stats.get('game_sessions', [])))
+        total_games = len(game_ids)
+        start_idx = page * HISTORY_ITEMS_PER_PAGE
+        page_games = game_ids[start_idx:start_idx + HISTORY_ITEMS_PER_PAGE]
+
+        # Get bot username
+        global _bot_username_cache
+        if _bot_username_cache is None:
+            bot_info = await context.bot.get_me()
+            _bot_username_cache = bot_info.username
+        bot_username = _bot_username_cache
+
+        # Profile pic
+        profile_pic = await _get_cached_profile_picture(context, user_id)
+
+        # Offload to thread
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            _image_executor,
+            _render_history_sync,
+            {
+                "user_id": user_id,
+                "first_name": first_name,
+                "username": username,
+                "total_bets": total_bets,
+                "total_wins": total_wins,
+                "total_losses": total_losses,
+                "total_wagered": total_wagered,
+                "total_games": total_games,
+                "page": page,
+                "page_games": page_games,
+                "bot_username": bot_username,
+            },
+            profile_pic,
+        )
+        return result
+    except Exception as e:
+        logging.error(f"Error generating history image for {user_id}: {e}")
+        return None
+
+
+def _render_history_sync(data: dict, profile_pic):
+    """Render history template image. Runs in ThreadPoolExecutor."""
+    try:
+        # Create image (1000x600)
+        W, H = 1000, 600
+        img = Image.new('RGBA', (W, H), (15, 25, 35, 255))
+        draw = ImageDraw.Draw(img)
+
+        # Load fonts
+        try:
+            font_big = ImageFont.truetype(DASHBOARD_FONT_PATH, 32)
+            font_med = ImageFont.truetype(DASHBOARD_FONT_PATH, 22)
+            font_small = ImageFont.truetype(DASHBOARD_FONT_PATH, 16)
+            font_tiny = ImageFont.truetype(DASHBOARD_FONT_PATH, 13)
+        except Exception:
+            font_big = ImageFont.load_default()
+            font_med = font_big
+            font_small = font_big
+            font_tiny = font_big
+
+        # Starfield background dots
+        import random as _rng
+        _rng.seed(42)  # Consistent star positions
+        for _ in range(80):
+            sx, sy = _rng.randint(0, W), _rng.randint(0, H)
+            draw.ellipse((sx, sy, sx+2, sy+2), fill=(255, 255, 255, _rng.randint(30, 80)))
+
+        # Title
+        draw.text((350, 15), "Game History", fill=(255, 215, 0), font=font_big)
+
+        # Bot branding
+        draw.text((750, 18), f"@playcsino", fill=(255, 215, 0), font=font_med)
+        draw.text((750, 45), "Telegram Casino", fill=(0, 255, 255), font=font_tiny)
+
+        # Profile section
+        if profile_pic:
+            try:
+                pic = profile_pic.resize((80, 80), Image.Resampling.LANCZOS)
+                mask = create_circular_mask((80, 80))
+                if pic.mode != 'RGBA':
+                    pic = pic.convert('RGBA')
+                img.paste(pic, (30, 60), mask)
+            except Exception:
+                draw.ellipse((30, 60, 110, 140), fill=(42, 75, 110))
+        else:
+            draw.ellipse((30, 60, 110, 140), fill=(42, 75, 110))
+            draw.text((55, 85), data['first_name'][:2].upper(), fill=(255, 255, 255), font=font_med)
+
+        # User info
+        draw.text((130, 65), data['first_name'][:15], fill=(255, 255, 255), font=font_med)
+        draw.text((130, 95), f"@{data['username']}", fill=(180, 180, 180), font=font_small)
+        draw.text((130, 120), str(data['user_id']), fill=(200, 200, 200), font=font_tiny)
+
+        # Stats boxes
+        y_stats = 165
+        box_w = 220
+        box_h = 55
+        gap = 15
+
+        stats_data = [
+            ("TOTAL BETS", str(data['total_bets']), (0, 231, 1)),
+            ("WINS", str(data['total_wins']), (34, 197, 94)),
+            ("LOSSES", str(data['total_losses']), (239, 68, 68)),
+            ("WAGERED", f"${data['total_wagered']:,.2f}", (255, 215, 0))
+        ]
+
+        for i, (label, value, color) in enumerate(stats_data):
+            x = 30 + i * (box_w + gap)
+            # Box background
+            draw.rounded_rectangle((x, y_stats, x + box_w, y_stats + box_h), radius=8, fill=(26, 44, 61))
+            draw.rounded_rectangle((x, y_stats, x + box_w, y_stats + box_h), radius=8, outline=(37, 58, 78))
+            # Label
+            draw.text((x + 10, y_stats + 5), label, fill=(90, 106, 122), font=font_tiny)
+            # Value
+            draw.text((x + 10, y_stats + 24), value, fill=color, font=font_med)
+
+        # Game history entries
+        y_games = 240
+        page_games = data.get('page_games', [])
+        page = data.get('page', 0)
+        total_games = data.get('total_games', 0)
+
+        draw.text((30, y_games), f"Recent Games (Page {page + 1})", fill=(176, 196, 216), font=font_small)
+        y_games += 30
+
+        if not page_games:
+            draw.text((30, y_games + 20), "No games found. Start playing to see your history!", fill=(90, 106, 122), font=font_small)
+        else:
+            # Table header
+            draw.text((30, y_games), "#", fill=(90, 106, 122), font=font_tiny)
+            draw.text((70, y_games), "GAME", fill=(90, 106, 122), font=font_tiny)
+            draw.text((280, y_games), "BET", fill=(90, 106, 122), font=font_tiny)
+            draw.text((430, y_games), "MULT", fill=(90, 106, 122), font=font_tiny)
+            draw.text((560, y_games), "PROFIT", fill=(90, 106, 122), font=font_tiny)
+            draw.text((720, y_games), "RESULT", fill=(90, 106, 122), font=font_tiny)
+            draw.text((850, y_games), "ID", fill=(90, 106, 122), font=font_tiny)
+            y_games += 22
+
+            for idx, gid in enumerate(page_games):
+                game = game_sessions.get(gid, {})
+                if not game:
+                    continue
+
+                game_num = total_games - (page * HISTORY_ITEMS_PER_PAGE + idx)
+                game_type = game.get('game_type', 'unknown').replace('_', ' ').title()
+                bet_amount = game.get('bet_amount', 0.0)
+                multiplier = game.get('multiplier', 0)
+                is_win = game.get('win', False)
+                profit = bet_amount * multiplier - bet_amount if multiplier else -bet_amount
+                status = game.get('status', 'unknown')
+
+                row_y = y_games + idx * 28
+                # Alternating row background
+                if idx % 2 == 0:
+                    draw.rectangle((25, row_y - 2, W - 25, row_y + 24), fill=(20, 35, 50))
+
+                # Number
+                draw.text((30, row_y), f"#{game_num}", fill=(176, 196, 216), font=font_tiny)
+                # Game type
+                draw.text((70, row_y), game_type[:20], fill=(255, 255, 255), font=font_tiny)
+                # Bet
+                draw.text((280, row_y), f"${bet_amount:.2f}", fill=(176, 196, 216), font=font_tiny)
+                # Multiplier
+                mult_color = (0, 231, 1) if multiplier >= 1 else (239, 68, 68)
+                draw.text((430, row_y), f"{multiplier:.2f}x" if multiplier else "N/A", fill=mult_color, font=font_tiny)
+                # Profit
+                profit_color = (0, 231, 1) if profit >= 0 else (239, 68, 68)
+                draw.text((560, row_y), f"{'+'if profit>=0 else ''}${profit:.2f}", fill=profit_color, font=font_tiny)
+                # Result
+                result_text = "WIN" if is_win else "LOSS"
+                result_color = (0, 231, 1) if is_win else (239, 68, 68)
+                draw.text((720, row_y), result_text, fill=result_color, font=font_tiny)
+                # Game ID (truncated)
+                draw.text((850, row_y), str(gid)[:10], fill=(90, 106, 122), font=font_tiny)
+
+        # Footer
+        draw.text((350, H - 30), "Play responsibly | @playcsino", fill=(90, 106, 122), font=font_tiny)
+
+        # Convert to bytes
+        output = BytesIO()
+        img.convert('RGB').save(output, format='JPEG', quality=90)
+        output.seek(0)
+        return output
+    except Exception as e:
+        logging.error(f"History image render error: {e}")
+        return None
+
+
+@check_banned
+@check_maintenance
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show user's game history with template image and pagination inline buttons."""
+    user = update.effective_user
+    await ensure_user_in_wallets(user.id, user.username, context=context)
+
+    stats = user_stats.get(user.id, {})
+    game_ids = list(reversed(stats.get('game_sessions', [])))
+    total_games = len(game_ids)
+
+    if total_games == 0:
+        await update.message.reply_text(
+            f"{pe('chart')} <b>Game History</b>\n\n"
+            f"No games found. Start playing to see your history!",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    page = 0
+    # Generate history template image
+    history_image = await generate_history_image(user.id, context, page)
+
+    # Build pagination keyboard
+    keyboard = _build_history_keyboard(game_ids, page, user.id)
+
+    if history_image:
+        sent = await update.message.reply_photo(
+            photo=history_image,
+            caption=f"{pe('chart')} <b>Game History</b> ({total_games} games)",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    else:
+        sent = await update.message.reply_text(
+            f"{pe('chart')} <b>Game History</b> ({total_games} games)\n\n"
+            f"Use the buttons below to browse your games.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    set_menu_owner(sent, user.id)
+
+
+def _build_history_keyboard(game_ids, page, user_id):
+    """Build inline keyboard for history pagination."""
+    total = len(game_ids)
+    start = page * HISTORY_ITEMS_PER_PAGE
+    page_items = game_ids[start:start + HISTORY_ITEMS_PER_PAGE]
+
+    keyboard = []
+
+    # Game number buttons - Row 1 (first 5)
+    row1 = []
+    for i, gid in enumerate(page_items[:5]):
+        game_num = total - (start + i)
+        row1.append(InlineKeyboardButton(
+            str(game_num),
+            callback_data=f"hist_view_{gid}"
+        ))
+    if row1:
+        keyboard.append(row1)
+
+    # Game number buttons - Row 2 (next 5)
+    row2 = []
+    for i, gid in enumerate(page_items[5:10]):
+        game_num = total - (start + 5 + i)
+        row2.append(InlineKeyboardButton(
+            str(game_num),
+            callback_data=f"hist_view_{gid}"
+        ))
+    if row2:
+        keyboard.append(row2)
+
+    # Navigation row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("Previous", callback_data=f"hist_page_{user_id}_{page - 1}"))
+    if (page + 1) * HISTORY_ITEMS_PER_PAGE < total:
+        nav_row.append(InlineKeyboardButton("Next", callback_data=f"hist_page_{user_id}_{page + 1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    return keyboard
+
+
+async def history_page_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle history page navigation callbacks."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    # Parse callback: hist_page_{user_id}_{page}
+    parts = query.data.split('_')
+    if len(parts) < 4:
+        return
+    target_user_id = int(parts[2])
+    page = int(parts[3])
+
+    # Verify ownership
+    if query.from_user.id != target_user_id:
+        await query.answer("This is not your history.", show_alert=True)
+        return
+
+    stats = user_stats.get(target_user_id, {})
+    game_ids = list(reversed(stats.get('game_sessions', [])))
+    total_games = len(game_ids)
+
+    # Generate new page image
+    history_image = await generate_history_image(target_user_id, context, page)
+    keyboard = _build_history_keyboard(game_ids, page, target_user_id)
+
+    try:
+        if history_image:
+            await query.message.delete()
+            sent = await context.bot.send_photo(
+                chat_id=query.message.chat_id,
+                photo=history_image,
+                caption=f"{pe('chart')} <b>Game History</b> ({total_games} games) - Page {page + 1}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            set_menu_owner(sent, target_user_id)
+        else:
+            await safe_edit_message(
+                query,
+                f"{pe('chart')} <b>Game History</b> ({total_games} games) - Page {page + 1}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+    except Exception as e:
+        logging.error(f"History page callback error: {e}")
+
+
+async def history_view_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle viewing a specific game from history."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+
+    # Parse callback: hist_view_{game_id}
+    game_id = query.data.replace("hist_view_", "")
+    game = game_sessions.get(game_id)
+
+    if not game:
+        await query.answer("Game data not found.", show_alert=True)
+        return
+
+    # Verify ownership
+    if game.get('user_id') != query.from_user.id:
+        await query.answer("This is not your game.", show_alert=True)
+        return
+
+    game_type = game.get('game_type', 'unknown').replace('_', ' ').title()
+    bet_amount = game.get('bet_amount', 0.0)
+    multiplier = game.get('multiplier', 0)
+    is_win = game.get('win', False)
+    profit = bet_amount * multiplier - bet_amount if multiplier else -bet_amount
+    risk = game.get('risk', '')
+    rows = game.get('rows', '')
+    timestamp = game.get('timestamp', 'N/A')
+
+    # Format timestamp
+    try:
+        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+        timestamp = dt.strftime('%Y-%m-%d %H:%M UTC')
+    except Exception:
+        pass
+
+    result_emoji = pe('win') if is_win else pe('cross')
+    result_text = "WIN" if is_win else "LOSS"
+    profit_text = f"+${profit:.2f}" if profit >= 0 else f"-${abs(profit):.2f}"
+
+    msg = (
+        f"{pe('chart')} <b>Game Details</b>\n\n"
+        f"<b>Game:</b> {game_type}\n"
+        f"<b>Game ID:</b> <code>{game_id}</code>\n"
+        f"<b>Bet:</b> ${bet_amount:.2f}\n"
+    )
+
+    if multiplier:
+        msg += f"<b>Multiplier:</b> {multiplier:.2f}x\n"
+    if risk:
+        msg += f"<b>Risk:</b> {risk.upper()}\n"
+    if rows:
+        msg += f"<b>Rows:</b> {rows}\n"
+
+    msg += (
+        f"\n{result_emoji} <b>Result:</b> {result_text}\n"
+        f"<b>Profit:</b> {profit_text}\n"
+        f"<b>Time:</b> {timestamp}\n"
+    )
+
+    # Back button
+    keyboard = [[InlineKeyboardButton("Back to History", callback_data=f"hist_page_{query.from_user.id}_0")]]
+
+    # Add provably fair button if available
+    pf_record = provably_fair_records.get(game_id)
+    if pf_record:
+        bot_username = await get_bot_username(context)
+        keyboard[0].insert(0, InlineKeyboardButton(
+            "Verify",
+            url=f"https://t.me/{bot_username}?start=provablyfair_{game_id}"
+        ))
+
+    await safe_edit_message(
+        query,
+        msg,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
 
 @check_banned
 @check_maintenance
@@ -23726,6 +24497,9 @@ async def post_init(application: Application):
     # Start OxaPay webhook server
     application.create_task(start_oxapay_webhook_server(application))
 
+    # Start Plinko web dashboard server
+    application.create_task(start_plinko_web_server(application))
+
     # Initialize deposit DB connection pool (if available)
     try:
         if 'deposit_db' in globals() and deposit_db and hasattr(deposit_db, '_init_pool'):
@@ -24411,6 +25185,8 @@ def main():
     app.add_handler(CommandHandler("reset", reset_recovery_command, block=False)) # NEW
     app.add_handler(CommandHandler("export", export_command, block=False)) # NEW
     app.add_handler(CommandHandler("claim", claim_gift_code_command, block=False)) # NEW
+    # History command for users (with template image and pagination)
+    app.add_handler(CommandHandler("history", history_command, block=False))
     app.add_handler(CommandHandler("leaderboardrf", leaderboard_referral_command, block=False)) # NEW
     app.add_handler(CommandHandler("weekly", weekly_bonus_command, block=False)) # NEW
     app.add_handler(CommandHandler("monthly", monthly_bonus_command, block=False)) # NEW
@@ -24512,6 +25288,9 @@ def main():
     app.add_handler(CallbackQueryHandler(mines_pick_callback, pattern=r"^mines_", block=False))
     app.add_handler(CallbackQueryHandler(blackjack_callback, pattern=r"^bj_", block=False))
     app.add_handler(CallbackQueryHandler(game_info_callback, pattern=r"^game_", block=False))
+    # History pagination and view callbacks
+    app.add_handler(CallbackQueryHandler(history_page_callback, pattern=r"^hist_page_", block=False))
+    app.add_handler(CallbackQueryHandler(history_view_callback, pattern=r"^hist_view_", block=False))
     app.add_handler(CallbackQueryHandler(clear_confirm_callback, pattern=r"^(clear|clearall)_confirm_", block=False))
     app.add_handler(CallbackQueryHandler(match_invite_callback, pattern=r"^(accept_|decline_)", block=False))
     app.add_handler(CallbackQueryHandler(stop_confirm_callback, pattern=r"^stop_confirm_", block=False))
