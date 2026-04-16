@@ -16291,7 +16291,7 @@ PLINKO_WEB_MIN_BET = 0.10
 # Telegram WebApps REQUIRE https. If using nginx, proxy /plinko to localhost:8081.
 # Example: "https://play-casino.app" (no trailing slash, no port — nginx handles routing)
 # Leave empty to auto-construct from OXAPAY_WEBHOOK_HOST (fallback).
-PLINKO_WEB_URL = ""  # <-- FILL THIS IN with your HTTPS domain
+PLINKO_WEB_URL = "https://play-casino.app"  # Your HTTPS domain (Telegram requires HTTPS for Mini Apps)
 
 # Plinko security settings
 PLINKO_AUTH_MAX_AGE_SECONDS = 3600    # Max age of initData before rejection (1 hour)
