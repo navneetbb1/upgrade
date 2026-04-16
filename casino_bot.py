@@ -16284,7 +16284,7 @@ PLINKO_WEB_MULTIPLIERS = {
 
 # Plinko Web Dashboard Configuration
 PLINKO_WEB_ENABLED = True
-PLINKO_WEB_PORT = 8081  # Separate port for plinko web dashboard
+PLINKO_WEB_PORT = 8086  # Separate port for plinko web dashboard
 PLINKO_WEB_MAX_BET = 500.0
 PLINKO_WEB_MIN_BET = 0.10
 # IMPORTANT: Set this to your VPS public HTTPS URL for the Plinko mini app.
