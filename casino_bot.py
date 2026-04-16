@@ -5046,59 +5046,152 @@ async def start_oxapay_webhook_server(application=None):
 
 
 # ===== PLINKO WEB DASHBOARD SERVER =====
-# Telegram WebApp initData validation
+
+import math  # For math.isfinite in bet validation
+
+# Telegram WebApp initData validation (HMAC-SHA256 + timestamp anti-replay)
 def _validate_telegram_webapp_data(init_data_raw: str) -> dict | None:
     """Validate Telegram WebApp initData using HMAC-SHA256.
-    Returns parsed user dict on success, None on failure."""
-    if not init_data_raw:
+
+    Security measures:
+    1. HMAC-SHA256 signature verification using BOT_TOKEN
+    2. auth_date expiry check (prevents replay attacks)
+    3. Strict parameter parsing
+
+    Returns parsed user dict on success, None on failure.
+    """
+    if not init_data_raw or not isinstance(init_data_raw, str):
         return None
     try:
         import urllib.parse as urlparse
         params = dict(urlparse.parse_qsl(init_data_raw, keep_blank_values=True))
         received_hash = params.pop('hash', '')
-        if not received_hash:
+        if not received_hash or len(received_hash) != 64:
+            logging.warning("Plinko auth: missing or invalid hash length")
             return None
 
+        # --- Anti-replay: check auth_date is not too old ---
+        auth_date_str = params.get('auth_date', '')
+        if not auth_date_str:
+            logging.warning("Plinko auth: missing auth_date")
+            return None
+        try:
+            auth_date = int(auth_date_str)
+            now_ts = int(datetime.now(timezone.utc).timestamp())
+            age = now_ts - auth_date
+            if age < -60:  # Allow 60s clock skew
+                logging.warning(f"Plinko auth: auth_date is in the future by {abs(age)}s")
+                return None
+            if age > PLINKO_AUTH_MAX_AGE_SECONDS:
+                logging.warning(f"Plinko auth: initData expired ({age}s old, max {PLINKO_AUTH_MAX_AGE_SECONDS}s)")
+                return None
+        except (ValueError, TypeError):
+            logging.warning("Plinko auth: invalid auth_date format")
+            return None
+
+        # --- HMAC-SHA256 signature verification ---
         # Build check string (alphabetically sorted key=value pairs)
         data_check_string = '\n'.join(f"{k}={v}" for k, v in sorted(params.items()))
 
-        # HMAC-SHA256 with WebAppData key
+        # Two-step HMAC: first derive secret from "WebAppData" + BOT_TOKEN,
+        # then sign the data_check_string
         secret_key = hmac.new(b'WebAppData', BOT_TOKEN.encode(), hashlib.sha256).digest()
         computed_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(computed_hash, received_hash):
+            logging.warning("Plinko auth: HMAC signature mismatch")
             return None
 
-        # Parse user JSON
-        user_json = params.get('user', '{}')
+        # --- Parse and validate user JSON ---
+        user_json = params.get('user', '')
+        if not user_json:
+            logging.warning("Plinko auth: missing user field")
+            return None
         user_data = json.loads(user_json)
+        if not isinstance(user_data, dict) or 'id' not in user_data:
+            logging.warning("Plinko auth: user data missing 'id' field")
+            return None
+        # Ensure user_id is an integer
+        if not isinstance(user_data['id'], int):
+            logging.warning("Plinko auth: user id is not an integer")
+            return None
+
         return user_data
+    except json.JSONDecodeError:
+        logging.warning("Plinko auth: invalid user JSON")
+        return None
     except Exception as e:
-        logging.error(f"WebApp data validation error: {e}")
+        logging.error(f"Plinko auth validation error: {e}")
         return None
 
 
+def _plinko_check_rate_limit(user_id: int) -> bool:
+    """Check if user exceeds the per-minute bet rate limit.
+    Returns True if WITHIN limit (allowed), False if rate-limited."""
+    now = datetime.now(timezone.utc).timestamp()
+    cutoff = now - 60  # 1 minute window
+
+    if user_id not in _plinko_rate_limits:
+        _plinko_rate_limits[user_id] = []
+
+    # Prune old entries
+    timestamps = _plinko_rate_limits[user_id]
+    _plinko_rate_limits[user_id] = [t for t in timestamps if t > cutoff]
+
+    if len(_plinko_rate_limits[user_id]) >= PLINKO_RATE_LIMIT_BETS_PER_MIN:
+        return False  # Rate limited
+
+    _plinko_rate_limits[user_id].append(now)
+    return True  # Allowed
+
+
 async def _plinko_get_user_from_request(request: aiohttp.web.Request) -> dict | None:
-    """Extract and validate user from Plinko web request."""
+    """Extract and validate user from Plinko web request.
+    Uses Telegram WebApp initData from X-Auth-Token header."""
     auth_token = request.headers.get('X-Auth-Token', '')
+    if not auth_token:
+        return None
     user_data = _validate_telegram_webapp_data(auth_token)
     if not user_data or 'id' not in user_data:
         return None
     return user_data
 
 
+# HTML cache to avoid re-reading from disk on every request
+_plinko_html_cache: str | None = None
+_plinko_html_cache_time: float = 0
+
 async def plinko_serve_html(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    """Serve the Plinko web dashboard HTML."""
-    html_path = os.path.join(os.path.dirname(__file__), 'plinko_web', 'index.html')
-    if not os.path.exists(html_path):
-        return aiohttp.web.Response(text="Plinko dashboard not found", status=404)
-    with open(html_path, 'r', encoding='utf-8') as f:
-        html_content = f.read()
-    return aiohttp.web.Response(text=html_content, content_type='text/html')
+    """Serve the Plinko web dashboard HTML (cached in memory)."""
+    global _plinko_html_cache, _plinko_html_cache_time
+    now = datetime.now(timezone.utc).timestamp()
+
+    # Cache HTML for 60 seconds (avoids disk reads under load)
+    if _plinko_html_cache is None or (now - _plinko_html_cache_time) > 60:
+        html_path = os.path.join(os.path.dirname(__file__), 'plinko_web', 'index.html')
+        if not os.path.exists(html_path):
+            return aiohttp.web.Response(text="Plinko dashboard not found", status=404)
+        with open(html_path, 'r', encoding='utf-8') as f:
+            _plinko_html_cache = f.read()
+        _plinko_html_cache_time = now
+
+    return aiohttp.web.Response(
+        text=_plinko_html_cache,
+        content_type='text/html',
+        headers={
+            'Cache-Control': 'public, max-age=60',
+            'X-Content-Type-Options': 'nosniff',
+            'X-Frame-Options': 'ALLOWALL',  # Required for Telegram WebApp iframe
+        }
+    )
 
 
 async def plinko_api_user(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    """GET /plinko/api/user - Get user balance and provably fair seeds."""
+    """GET /plinko/api/user - Get user balance and provably fair seeds.
+
+    Security: Authenticated via Telegram WebApp initData (HMAC-SHA256).
+    Only returns server_seed_hash (never the raw server seed).
+    """
     user_data = await _plinko_get_user_from_request(request)
     if not user_data:
         return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
@@ -5106,16 +5199,24 @@ async def plinko_api_user(request: aiohttp.web.Request) -> aiohttp.web.Response:
     user_id = user_data['id']
     username = user_data.get('username', user_data.get('first_name', 'Player'))
 
-    # Ensure user exists in wallets
+    # Ensure user exists in wallets (must have used /start first)
     if user_id not in user_stats:
-        # User needs to be initialized via bot first
         return aiohttp.web.json_response({"error": "Please start the bot first with /start"}, status=403)
+
+    # Check all ban types
+    if user_id in _banned_set or user_id in _tempbanned_set:
+        return aiohttp.web.json_response({"error": "Account restricted"}, status=403)
+
+    # Check maintenance mode
+    if bot_settings.get("maintenance_mode", False):
+        return aiohttp.web.json_response({"error": "Bot is under maintenance"}, status=503)
 
     balance_usd = get_active_balance_usd(user_id)
     active_coin = get_active_currency(user_id)
 
     # Get or generate provably fair seeds
     seeds = get_user_seeds(user_id)
+    # SECURITY: Only return the HASH of the server seed, never the raw seed
     server_seed_hash = hashlib.sha256(seeds['server_seed'].encode()).hexdigest()
 
     return aiohttp.web.json_response({
@@ -5130,7 +5231,19 @@ async def plinko_api_user(request: aiohttp.web.Request) -> aiohttp.web.Response:
 
 
 async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
-    """POST /plinko/api/bet - Place a Plinko bet from web dashboard."""
+    """POST /plinko/api/bet - Place a Plinko bet from web dashboard.
+
+    Security measures:
+    1. Telegram WebApp initData HMAC-SHA256 authentication
+    2. auth_date anti-replay (max 1 hour)
+    3. Per-user rate limiting (60 bets/minute)
+    4. Request body size limit (4KB)
+    5. Input validation (NaN/Infinity/negative/type checks)
+    6. Atomic wallet deduction (async lock prevents double-spend)
+    7. Ban and maintenance checks
+    8. Provably fair result generation
+    """
+    # --- Auth ---
     user_data = await _plinko_get_user_from_request(request)
     if not user_data:
         return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
@@ -5139,49 +5252,77 @@ async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
     if user_id not in user_stats:
         return aiohttp.web.json_response({"error": "Please start the bot first"}, status=403)
 
-    # Check bans
-    if user_id in _banned_set:
+    # --- Ban checks (permanent + temporary) ---
+    if user_id in _banned_set or user_id in _tempbanned_set:
         return aiohttp.web.json_response({"error": "Account restricted"}, status=403)
 
-    # Check game enabled
+    # --- Maintenance mode ---
+    if bot_settings.get("maintenance_mode", False):
+        return aiohttp.web.json_response({"error": "Bot is under maintenance"}, status=503)
+
+    # --- Game enabled check ---
     if not is_game_enabled("plinko"):
         return aiohttp.web.json_response({"error": "Plinko is under maintenance"}, status=503)
+
+    # --- Rate limiting ---
+    if not _plinko_check_rate_limit(user_id):
+        return aiohttp.web.json_response(
+            {"error": "Too many bets. Please slow down."},
+            status=429
+        )
+
+    # --- Request body size limit ---
+    if request.content_length and request.content_length > PLINKO_MAX_REQUEST_BODY_BYTES:
+        return aiohttp.web.json_response({"error": "Request too large"}, status=413)
 
     try:
         body = await request.json()
     except Exception:
         return aiohttp.web.json_response({"error": "Invalid request body"}, status=400)
 
+    if not isinstance(body, dict):
+        return aiohttp.web.json_response({"error": "Invalid request format"}, status=400)
+
+    # --- Extract and validate bet parameters ---
     bet_amount = body.get('amount', 0)
     risk = body.get('risk', 'medium')
     rows = body.get('rows', 16)
 
-    # Validate inputs
-    if not isinstance(bet_amount, (int, float)) or bet_amount < PLINKO_WEB_MIN_BET:
+    # Type coercion safety
+    try:
+        bet_amount = float(bet_amount)
+        rows = int(rows)
+    except (ValueError, TypeError):
+        return aiohttp.web.json_response({"error": "Invalid parameter types"}, status=400)
+
+    # NaN / Infinity / negative checks
+    if not math.isfinite(bet_amount) or bet_amount <= 0:
+        return aiohttp.web.json_response({"error": "Invalid bet amount"}, status=400)
+
+    if bet_amount < PLINKO_WEB_MIN_BET:
         return aiohttp.web.json_response({"error": f"Minimum bet is ${PLINKO_WEB_MIN_BET:.2f}"}, status=400)
     if bet_amount > PLINKO_WEB_MAX_BET:
         return aiohttp.web.json_response({"error": f"Maximum bet is ${PLINKO_WEB_MAX_BET:.2f}"}, status=400)
-    if risk not in ('low', 'medium', 'high'):
+
+    # Round to 2 decimal places to prevent floating point exploits
+    bet_amount = round(bet_amount, 2)
+
+    if not isinstance(risk, str) or risk not in ('low', 'medium', 'high'):
         return aiohttp.web.json_response({"error": "Invalid risk level"}, status=400)
     if rows not in (8, 10, 12, 14, 16):
         return aiohttp.web.json_response({"error": "Invalid row count"}, status=400)
 
-    # Check balance
-    balance_usd = get_active_balance_usd(user_id)
-    if bet_amount > balance_usd + 0.001:
-        return aiohttp.web.json_response({"error": "Insufficient balance"}, status=400)
-
-    # Deduct bet atomically
+    # --- Atomic balance deduction (per-user lock prevents double-spend) ---
     try:
         crypto_deducted, coin = await deduct_wallet_safe(user_id, bet_amount)
     except ValueError:
         return aiohttp.web.json_response({"error": "Insufficient balance"}, status=400)
 
-    # Get multipliers for this row/risk combo
+    # --- Get multipliers for this row/risk combo ---
     mults = PLINKO_WEB_MULTIPLIERS.get(rows, {}).get(risk, PLINKO_MULTIPLIERS.get(risk, [1.0]))
     num_slots = len(mults)
 
-    # Generate provably fair result
+    # --- Generate provably fair result ---
     seeds = get_user_seeds(user_id)
     server_seed = seeds['server_seed']
     client_seed = seeds['client_seed']
@@ -5189,22 +5330,22 @@ async def plinko_api_bet(request: aiohttp.web.Request) -> aiohttp.web.Response:
     result_index = get_provably_fair_result(server_seed, client_seed, nonce, num_slots)
     multiplier = mults[result_index]
 
-    winnings = bet_amount * multiplier
-    profit = winnings - bet_amount
+    winnings = round(bet_amount * multiplier, 8)  # Precision for crypto
+    profit = round(winnings - bet_amount, 8)
     win = multiplier >= 1.0
 
-    # Credit winnings
+    # --- Credit winnings ---
     credit_wallet(user_id, winnings)
 
-    # Generate game ID and record
+    # --- Generate game ID and increment nonce ---
     game_id = generate_unique_id('PLINKO')
     increment_user_nonce(user_id)
 
-    # Update stats
+    # --- Update stats (fire-and-forget for non-critical tasks) ---
     await update_stats_on_bet(user_id, game_id, bet_amount, win, multiplier=multiplier, context=None)
     save_user_data(user_id)
 
-    # Store game session
+    # --- Store game session (for history and provably fair verification) ---
     game_sessions[game_id] = {
         "id": game_id,
         "game_type": "plinko",
@@ -5252,6 +5393,11 @@ async def plinko_api_history(request: aiohttp.web.Request) -> aiohttp.web.Respon
         return aiohttp.web.json_response({"error": "Unauthorized"}, status=401)
 
     user_id = user_data['id']
+
+    # Ban check for history too
+    if user_id in _banned_set:
+        return aiohttp.web.json_response({"error": "Account restricted"}, status=403)
+
     stats = user_stats.get(user_id, {})
     game_ids = stats.get('game_sessions', [])
 
@@ -5276,27 +5422,44 @@ async def plinko_api_history(request: aiohttp.web.Request) -> aiohttp.web.Respon
     return aiohttp.web.json_response({"bets": bets})
 
 
+def _get_plinko_web_url() -> str | None:
+    """Get the configured Plinko web dashboard URL.
+    Uses PLINKO_WEB_URL if set, otherwise falls back to OXAPAY_WEBHOOK_HOST construction."""
+    if PLINKO_WEB_URL:
+        url = PLINKO_WEB_URL.rstrip('/')
+        return f"{url}/plinko"
+    if OXAPAY_WEBHOOK_HOST:
+        host = OXAPAY_WEBHOOK_HOST.rstrip('/')
+        return f"{host}:{PLINKO_WEB_PORT}/plinko"
+    return None
+
+
 async def start_plinko_web_server(application=None):
     """Start the Plinko web dashboard aiohttp server."""
     if not PLINKO_WEB_ENABLED:
         logging.info("Plinko web dashboard disabled.")
         return
 
-    plinko_app = aiohttp.web.Application()
+    plinko_app = aiohttp.web.Application(client_max_size=PLINKO_MAX_REQUEST_BODY_BYTES)
 
     # CORS middleware for Telegram WebApp
     @aiohttp.web.middleware
-    async def cors_middleware(request, handler):
+    async def cors_and_security_middleware(request, handler):
+        # Handle CORS preflight
         if request.method == 'OPTIONS':
             resp = aiohttp.web.Response()
         else:
             resp = await handler(request)
+        # Telegram WebApp runs in an iframe; needs permissive CORS
         resp.headers['Access-Control-Allow-Origin'] = '*'
         resp.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         resp.headers['Access-Control-Allow-Headers'] = 'Content-Type, X-Auth-Token'
+        # Security headers
+        resp.headers['X-Content-Type-Options'] = 'nosniff'
+        resp.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
         return resp
 
-    plinko_app.middlewares.append(cors_middleware)
+    plinko_app.middlewares.append(cors_and_security_middleware)
 
     # Routes
     plinko_app.router.add_get('/plinko', plinko_serve_html)
@@ -5310,6 +5473,11 @@ async def start_plinko_web_server(application=None):
     site = aiohttp.web.TCPSite(runner, "0.0.0.0", PLINKO_WEB_PORT)
     await site.start()
     logging.info(f"Plinko web dashboard listening on 0.0.0.0:{PLINKO_WEB_PORT}")
+    plinko_url = _get_plinko_web_url()
+    if plinko_url:
+        logging.info(f"Plinko WebApp URL: {plinko_url}")
+    else:
+        logging.warning("PLINKO_WEB_URL not configured! Set it in the config section for Telegram WebApp buttons to work.")
 
 
 # ===== BACKGROUND TASKS =====
@@ -8868,15 +9036,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # DM: Original behavior
     # NEW UI STRUCTURE - Casino themed with COLORED buttons (Bot API 9.4)
-    # Build Plinko WebApp URL
-    plinko_web_url = f"{OXAPAY_WEBHOOK_HOST}:{PLINKO_WEB_PORT}/plinko" if OXAPAY_WEBHOOK_HOST else None
+    # Build Plinko WebApp URL using centralized helper
+    plinko_web_url = _get_plinko_web_url() if PLINKO_WEB_ENABLED else None
 
     keyboard = [
         # Row 0: Plinko Web Dashboard (NEW - above deposit/withdraw)
     ]
 
-    # Add Plinko WebApp button if web dashboard is enabled
-    if PLINKO_WEB_ENABLED and plinko_web_url:
+    # Add Plinko WebApp button if web dashboard is enabled and URL is configured
+    if plinko_web_url:
         from telegram import WebAppInfo
         plinko_btn = InlineKeyboardButton(
             "Plinko",
@@ -16119,6 +16287,17 @@ PLINKO_WEB_ENABLED = True
 PLINKO_WEB_PORT = 8081  # Separate port for plinko web dashboard
 PLINKO_WEB_MAX_BET = 500.0
 PLINKO_WEB_MIN_BET = 0.10
+# IMPORTANT: Set this to your VPS public HTTPS URL for the Plinko mini app.
+# Telegram WebApps REQUIRE https. If using nginx, proxy /plinko to localhost:8081.
+# Example: "https://play-casino.app" (no trailing slash, no port — nginx handles routing)
+# Leave empty to auto-construct from OXAPAY_WEBHOOK_HOST (fallback).
+PLINKO_WEB_URL = ""  # <-- FILL THIS IN with your HTTPS domain
+
+# Plinko security settings
+PLINKO_AUTH_MAX_AGE_SECONDS = 3600    # Max age of initData before rejection (1 hour)
+PLINKO_RATE_LIMIT_BETS_PER_MIN = 60  # Max bets per user per minute
+PLINKO_MAX_REQUEST_BODY_BYTES = 4096  # Max JSON body size for bet requests
+_plinko_rate_limits: dict = {}  # {user_id: [timestamp, timestamp, ...]}
 
 @check_banned
 @check_maintenance
@@ -16135,8 +16314,8 @@ async def plinko_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # If no args or just /plinko, show WebApp button in DM
     if len(args) == 1:
-        plinko_web_url = f"{OXAPAY_WEBHOOK_HOST}:{PLINKO_WEB_PORT}/plinko" if OXAPAY_WEBHOOK_HOST else None
-        if PLINKO_WEB_ENABLED and plinko_web_url and update.effective_chat.type == "private":
+        plinko_web_url = _get_plinko_web_url() if PLINKO_WEB_ENABLED else None
+        if plinko_web_url and update.effective_chat.type == "private":
             from telegram import WebAppInfo
             keyboard = [[InlineKeyboardButton(
                 "Open Plinko",
